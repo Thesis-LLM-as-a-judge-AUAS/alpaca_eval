@@ -20,7 +20,6 @@ def logloss(y_true, y_pred):
 
 
 
-
 class LengthControlledAlpacaEval:
     """
     Implementation of Length-Controlled AlpacaEval as described in the paper.
@@ -248,28 +247,52 @@ class LengthControlledAlpacaEval:
 
 # Demonstration of the implementation
 if __name__ == "__main__":
-    print("Download GPT-3.5 dataset...")
+    print("Download GPT-3.5 + Auto-J dataset...")
     gpt_3_5_data = pd.read_json("./fair-eval-test/alpaca-auto-j.json")
 
-    print("\nInitializing Length-Controlled AlpacaEval with GPT-3.5...")
+    print("\nInitializing Length-Controlled AlpacaEval with GPT-3.5 + Auto-J...")
     lc_eval = LengthControlledAlpacaEval(l2_reg=0.01, cv_folds=5)
 
-    print("\nFitting Length-Controlled AlpacaEval model with GPT-3.5...")
+    print("\nFitting Length-Controlled AlpacaEval model with GPT-3.5 + Auto-J...")
     lc_eval.fit(gpt_3_5_data)
 
-    print("\nTesting Length-Controlled AlpacaEval model with GPT-3.5...")
+    print("\nTesting Length-Controlled AlpacaEval model with GPT-3.5 + Auto-J...")
     lc_eval.test(gpt_3_5_data, name="gpt-3.5")
 
-    print("Download GPT-4 dataset...")
+    print("Download GPT-4 + Auto-J dataset...")
     gpt_4_data = pd.read_json("./fair-eval-test/alpaca-auto-j-gpt4.json")
 
-    print("\nInitializing Length-Controlled AlpacaEval with GPT-4...")
+    print("\nInitializing Length-Controlled AlpacaEval with GPT-4 + Auto-J...")
     lc_eval_gpt4 = LengthControlledAlpacaEval(l2_reg=0.01, cv_folds=5)
 
-    print("\nFitting Length-Controlled AlpacaEval model with GPT-4...")
+    print("\nFitting Length-Controlled AlpacaEval model with GPT-4 + Auto-J...")
     lc_eval_gpt4.fit(gpt_4_data)
 
-    print("\nTesting Length-Controlled AlpacaEval model with GPT-4...")
+    print("\nTesting Length-Controlled AlpacaEval model with GPT-4 + Auto-J...")
     lc_eval_gpt4.test(gpt_4_data, name="gpt-4")
+
+    print("Download GPT-3.5 + Judgelm dataset...")
+    gpt_35_judgelm_data = pd.read_json("./fair-eval-test/alpaca-judgelm.json")
+
+    print("\nInitializing Length-Controlled AlpacaEval with GPT-3.5 + JudgeLM...")
+    lc_eval_gpt35_judgelm = LengthControlledAlpacaEval(l2_reg=0.01, cv_folds=5)
+
+    print("\nFitting Length-Controlled AlpacaEval model with GPT-3.5 + JudgeLM...")
+    lc_eval_gpt35_judgelm.fit(gpt_35_judgelm_data)
+
+    print("\nTesting Length-Controlled AlpacaEval model with GPT-3.5 + JudgeLM...")
+    lc_eval_gpt35_judgelm.test(gpt_35_judgelm_data, name="gpt-3-5-judgelm")
+
+    print("Download GPT-4 + Judgelm dataset...")
+    gpt_4_judgelm_data = pd.read_json("./fair-eval-test/alpaca-judgelm-gpt4.json")
+
+    print("\nInitializing Length-Controlled AlpacaEval with GPT-3.5 + JudgeLM...")
+    lc_eval_gpt4_judgelm = LengthControlledAlpacaEval(l2_reg=0.01, cv_folds=5)
+
+    print("\nFitting Length-Controlled AlpacaEval model with GPT-3.5 + JudgeLM...")
+    lc_eval_gpt4_judgelm.fit(gpt_4_judgelm_data)
+
+    print("\nTesting Length-Controlled AlpacaEval model with GPT-3.5 + JudgeLM...")
+    lc_eval_gpt4_judgelm.test(gpt_4_judgelm_data, name="gpt-4-judgelm")
 
     print("\nLength-controlled win rates successfully computed!")
