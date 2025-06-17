@@ -101,16 +101,8 @@ class LengthControlledAlpacaEval:
         for i, inst in enumerate(data['instruction']):
             instruction_matrix[i, instruction_to_idx[inst]] = 1
 
-        # Prepare features: model identity + instruction effects (ψ fixed to 1)
-        models = data['model_name'].unique()
-        model_matrix = np.zeros((n_samples, len(models)))
-        model_to_idx = {model: idx for idx, model in enumerate(models)}
-
-        for i, model in enumerate(data['model_name']):
-            model_matrix[i, model_to_idx[model]] = 1
-
         # Combine features: model effects + instruction effects
-        X = np.hstack([model_matrix, instruction_matrix])
+        X = np.hstack([instruction_matrix])
         y = data['preference'].values
 
         # Fit logistic regression
@@ -168,7 +160,6 @@ class LengthControlledAlpacaEval:
             # Combine features
             X = self._extract_features(model_data)
             y = model_data['preference'].values
-
             # Apply cross-validation to avoid overfitting
             custom_scorer = make_scorer(
                 logloss,
@@ -176,16 +167,24 @@ class LengthControlledAlpacaEval:
                 greater_is_better=False
             )
 
-            cv = KFold(n_splits=self.cv_folds)
+            if self.cv_folds > 1:
+                cv = KFold(n_splits=self.cv_folds)
 
-            self.model = LogisticRegressionCV(
-                fit_intercept=False,
-                cv=cv,
-                scoring=custom_scorer,
-                max_iter=1000,
-                solver='liblinear',
-            )
+                self.model = LogisticRegressionCV(
+                    fit_intercept=False,
+                    cv=cv,
+                    scoring=custom_scorer,
+                    max_iter=1000,
+                    solver='liblinear',
+                )
+            else:
+                self.model = LogisticRegression(
+                    fit_intercept=False,
+                    max_iter=1000,
+                    solver='liblinear',
+                )
 
+            print(y)
             self.model.fit(X, y)
 
         print(f"Fitted models for {len(models)} models")
@@ -294,5 +293,18 @@ if __name__ == "__main__":
 
     print("\nTesting Length-Controlled AlpacaEval model with GPT-3.5 + JudgeLM...")
     lc_eval_gpt4_judgelm.test(gpt_4_judgelm_data, name="gpt-4-judgelm")
+
+    print("Download Verbosity dataset...")
+    verbosity_data = pd.read_json("./fair-eval-test/final_verbs.json")
+    balanced = pd.read_json("./fair-eval-test/balanced.json")
+
+    print("\nInitializing Length-Controlled AlpacaEval with Verbosity...")
+    lc_eval_verbosity_data = LengthControlledAlpacaEval(l2_reg=0.01, cv_folds=1)
+
+    print("\nFitting Length-Controlled AlpacaEval model with Verbosity...")
+    lc_eval_verbosity_data.fit(balanced)
+
+    print("\nTesting Length-Controlled AlpacaEval model with Verbosity...")
+    lc_eval_verbosity_data.test(balanced, name="verbosity")
 
     print("\nLength-controlled win rates successfully computed!")
