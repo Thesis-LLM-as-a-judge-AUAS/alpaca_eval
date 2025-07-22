@@ -7,3 +7,7 @@ fire
 scipy
 patsy
 scikit-learn
+matplotlib
+dotenv
+seaborn
+statsmodels

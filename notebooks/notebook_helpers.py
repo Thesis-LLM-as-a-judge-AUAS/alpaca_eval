@@ -1,22 +1,14 @@
-import logging
-import pickle
+import os
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy.stats
-import seaborn as sns
-import sklearn
-import statsmodels.api as sm
-import statsmodels.formula.api as smf
 from IPython.display import display
 from scipy.stats import pearsonr
 from sklearn.metrics import accuracy_score
-from sklearn.metrics import log_loss as sk_log_loss
-from sklearn.metrics import make_scorer, mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score
 
-from alpaca_eval import analyze, annotators, constants, main, metrics, plotting, utils
 from alpaca_eval.metrics.glm_winrate import fit_LogisticRegressionCV, logloss, make_dmatrix_for_model
 
 CURR_DIR = Path(__file__).parent
@@ -69,8 +61,8 @@ def make_data(all_df_annotations, instruction_difficulty=None, baseline="gpt4_11
         rows_per_model[m]["generator_2"] = m
         # apply the transformation on the baseline length
         rows_per_model[m]["rand_delta_len_std"] = (
-            rows_per_model[m]["len_1"] - group_stats.loc[m, "group_mean"]
-        ) / group_stats.loc[m, "group_std"]
+                                                          rows_per_model[m]["len_1"] - group_stats.loc[m, "group_mean"]
+                                                  ) / group_stats.loc[m, "group_std"]
     df_lb = pd.concat(rows_per_model.values(), axis=0)
     df_lb["delta_len"] = 0
     df_lb["len_2"] = df_lb["len_1"]
@@ -88,22 +80,43 @@ def load_annotations(lb):
     annotations = {}
 
     for i in lb.index:
-        # load actual annotations to see if it was longer or not
-        df_annotations = pd.read_json(f"results/{i}/weighted_alpaca_eval_gpt4_turbo/annotations.json")
-        df_annotations["len_1"] = df_annotations["output_1"].str.len()
-        df_annotations["len_2"] = df_annotations["output_2"].str.len()
-        df_annotations["is_longer2"] = df_annotations["len_1"] < df_annotations["len_2"]
-        df_annotations["is_longer1"] = df_annotations["len_2"] < df_annotations["len_1"]
-        df_annotations["is_same_length"] = df_annotations["len_2"] == df_annotations["len_1"]
-        df_annotations["model"] = i
-        df_annotations["generator_2"] = i  # in case the annotations are not in the right format
-        annotations[i] = df_annotations.reset_index().drop(
-            columns=["raw_completion", "output_2", "output_1", "instruction"]
-        )  # drop all the long stuff that is not needed
+        annotations_file = f"../results/{i}/weighted_alpaca_eval_gpt4_turbo/annotations.json"
+
+        if os.path.isfile(annotations_file):
+            # load actual annotations to see if it was longer or not
+            df_annotations = pd.read_json(annotations_file)
+            if "raw_completion" in df_annotations.columns:
+                df_annotations["len_1"] = df_annotations["output_1"].str.len()
+                df_annotations["len_2"] = df_annotations["output_2"].str.len()
+                df_annotations["is_longer2"] = df_annotations["len_1"] < df_annotations["len_2"]
+                df_annotations["is_longer1"] = df_annotations["len_2"] < df_annotations["len_1"]
+                df_annotations["is_same_length"] = df_annotations["len_2"] == df_annotations["len_1"]
+                df_annotations["model"] = i
+                df_annotations["generator_2"] = i  # in case the annotations are not in the right format
+
+                def first_token(raw):
+                    try:
+                        return raw["logprobs"]["content"][0]["token"]
+                    except Exception:
+                        return None
+
+                tokens = df_annotations["raw_completion"].apply(first_token)
+                mask_lower = tokens == "m"
+
+                df_annotations["position_component"] = np.where(
+                    mask_lower,
+                    df_annotations["preference"] >= 1.5,  # if raw_completion == 'm'
+                    df_annotations["preference"] < 1.5  # else (we assume only 'M' remains)
+                ).astype(int)
+
+                annotations[i] = df_annotations.reset_index().drop(
+                    columns=["raw_completion", "output_2", "output_1", "instruction"],
+                    errors="ignore",
+                )  # drop all the long stuff that is not needed
 
     df_annotations = pd.concat(annotations, ignore_index=True).query("preference >= 0")
     df_annotations["preference"] = (
-        df_annotations["preference"].astype(float).replace({0.0: 1.5}) - 1
+            df_annotations["preference"].astype(float).replace({0.0: 1.5}) - 1
     )  # easier to work with
     return df_annotations
 
@@ -248,7 +261,7 @@ def disjoint_optimization_(lb, df, df_lb, formula, regularize_to_baseline_lambda
         if regularize_to_baseline_lambda:
             # divided by 2 becasue there are two gamed baselines.
             sample_weight = (df_gamed_and_m["not_gamed_baseline"]).astype(float) + (
-                regularize_to_baseline_lambda * (~df_gamed_and_m["not_gamed_baseline"])
+                    regularize_to_baseline_lambda * (~df_gamed_and_m["not_gamed_baseline"])
             ).astype(float) / 2
         else:
             sample_weight = None
