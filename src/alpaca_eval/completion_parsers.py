@@ -286,6 +286,7 @@ def logprob_parser(
         baseline_logprob = map_tokens_to_logprobs.get(numerator_token, missing)
         denominator_logprob = logsumexp([map_tokens_to_logprobs.get(t, missing) for t in denominator_tokens])
 
+        # If binary - p(numenator) > all(p(denominator))
         if is_binarize:
             # in the binary case, we want to know whether the baseline token has a higher logprob than all the others
             denominator_not_numerator_tokens = [t for t in denominator_tokens if t != numerator_token]
@@ -295,6 +296,7 @@ def logprob_parser(
             is_baseline_best = all([baseline_logprob > t for t in denominator_not_baseline_logprobs])
             out = 1 if is_baseline_best else 2
 
+        # If not binary - 2 - p == 2 - log(p(numenator)) / log(sum(e^log(p(denominator))))
         else:
             out_logprob = baseline_logprob - denominator_logprob  # typecheck doesn't recognize it's a float
             probability = np.exp(out_logprob)
