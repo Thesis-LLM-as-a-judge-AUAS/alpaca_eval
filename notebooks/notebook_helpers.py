@@ -105,9 +105,9 @@ def load_annotations(lb):
 
                 df_annotations["position_component"] = np.where(
                     mask_lower,
-                    df_annotations["preference"] >= 1.5,  # if raw_completion == 'm'
-                    df_annotations["preference"] < 1.5  # else (we assume only 'M' remains)
-                ).astype(int)
+                    np.where(df_annotations["preference"] >= 1.5, 1, -1),  # if raw_completion == 'm'
+                    np.where(df_annotations["preference"] < 1.5, 1, -1)  # else (assume only 'M' remains)
+                )
 
                 annotations[i] = df_annotations.reset_index().drop(
                     columns=["raw_completion", "output_2", "output_1", "instruction"],
