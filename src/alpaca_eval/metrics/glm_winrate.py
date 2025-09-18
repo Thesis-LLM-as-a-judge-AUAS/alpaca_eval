@@ -34,6 +34,16 @@ GLM_INFO = {
         "regularize_to_baseline_lambda": None,
         "kwargs": {"n_splits": 5},
     },
+    "length_position_controlled_v1": {
+        "formula": "np.tanh(std_delta_len) + instruction_difficulty + position_component + not_gamed_baseline.astype(float) - 1",
+        "regularize_to_baseline_lambda": None,
+        "kwargs": {"n_splits": 5},
+    },
+    "length_position_controlled_v2_interaction": {
+        "formula": "np.tanh(std_delta_len) + instruction_difficulty + position_component + position_length_interaction + not_gamed_baseline.astype(float) - 1",
+        "regularize_to_baseline_lambda": None,
+        "kwargs": {"n_splits": 5},
+    },
 }
 DFLT_WEIGHT_PATH = (
     Path(__file__).parent
@@ -43,7 +53,7 @@ DFLT_WEIGHT_PATH = (
 
 def get_length_controlled_winrate(
     annotations: Union[pd.DataFrame, Sequence[dict]],
-    glm_name="length_controlled_v1",
+    glm_name="length_position_controlled_v2_interaction",
     save_weights_dir: Optional[Union[str, Path]] = "auto",
     baseline: Optional[str] = None,
     is_add_glm_preference_inplace: bool = True,
@@ -234,6 +244,30 @@ def _get_featurized_data(
     std_delta_len = len_1 - len_2
     df = df[["preference", "index"]].copy()
     df["std_delta_len"] = std_delta_len / std_delta_len.std()
+
+    if "position_component" in df_annotations.columns:
+        df["position_component"] = df_annotations["position_component"].values
+    elif "raw_completion" in df_annotations.columns:
+        def first_token(raw):
+            try:
+                return raw["logprobs"]["content"][0]["token"]
+            except Exception:
+                return None
+
+        tokens = df_annotations["raw_completion"].apply(first_token)
+        # preference is already mapped to {0,1} later; here we use original scale to derive +/-1
+        pref_raw = df_annotations["preference"].astype(float)
+        mask_lower = tokens == "m"
+        df["position_component"] = np.where(
+            mask_lower,
+            np.where(pref_raw >= 1.5, 1, -1),
+            np.where(pref_raw < 1.5, 1, -1),
+        )
+    else:
+        df["position_component"] = 0.0
+
+    df['position_length_interaction'] =  df["position_component"] * df["std_delta_len"]
+
     df["preference"] = df["preference"].astype(float).replace({0.0: 1.5}) - 1  # easier to work with in [0,1]
     df["instruction_difficulty"] = df["index"].transform(lambda g: instruction_difficulty[g])
     df["not_gamed_baseline"] = True
@@ -241,6 +275,8 @@ def _get_featurized_data(
     # 3. make the design matrix for the model you would like to predict for, i.e., if there was no length difference
     df_test = df[["instruction_difficulty", "not_gamed_baseline"]].copy()
     df_test["std_delta_len"] = 0
+    df_test["position_component"] = 0
+    df_test["position_length_interaction"] = 0
 
     if regularize_to_baseline_lambda:
         df_gamed_and_m = pd.concat([df_gamed, df], axis=0)
@@ -276,6 +312,7 @@ def make_dmatrix_for_model(
     col_y_true : str, optional
         The name of the column containing the true labels.
     """
+
     df_XY_train = dmatrix(formula, df_train, return_type="dataframe")
     df_X_test = build_design_matrices([df_XY_train.design_info], df_test, return_type="dataframe")[0]
     df_XY_train[col_y_true] = df_train[col_y_true]  # adds the label
