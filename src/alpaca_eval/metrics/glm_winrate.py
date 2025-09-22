@@ -36,15 +36,16 @@ GLM_INFO = {
     },
     "length_position_controlled_v1": {
         "formula": "np.tanh(std_delta_len) + instruction_difficulty + position_component + not_gamed_baseline.astype(float) - 1",
-        "regularize_to_baseline_lambda": None,
+        "regularize_to_baseline_lambda": 0.2,
         "kwargs": {"n_splits": 5},
     },
     "length_position_controlled_v2_interaction": {
         "formula": "np.tanh(std_delta_len) + instruction_difficulty + position_component + position_length_interaction + not_gamed_baseline.astype(float) - 1",
-        "regularize_to_baseline_lambda": None,
+        "regularize_to_baseline_lambda": 0.2,
         "kwargs": {"n_splits": 5},
     },
 }
+
 DFLT_WEIGHT_PATH = (
     Path(__file__).parent
     / "weights/weighted_alpaca_eval_gpt4_turbo/length_controlled_v1/baseline_gpt4_1106_preview.csv"
@@ -53,7 +54,7 @@ DFLT_WEIGHT_PATH = (
 
 def get_length_controlled_winrate(
     annotations: Union[pd.DataFrame, Sequence[dict]],
-    glm_name="length_position_controlled_v2_interaction",
+    glm_name="length_position_controlled_v1",
     save_weights_dir: Optional[Union[str, Path]] = "auto",
     baseline: Optional[str] = None,
     is_add_glm_preference_inplace: bool = True,
@@ -234,8 +235,13 @@ def _get_featurized_data(
         force_download=constants.DATASETS_FORCE_DOWNLOAD,
         cache_dir=constants.DEFAULT_CACHE_DIR,
     )
-    df_gamed = pd.read_csv(out).drop(columns=["model"])
-    instruction_difficulty = df_gamed.drop_duplicates("index")["instruction_difficulty"]
+
+    df_gamed_out = pd.read_csv(out)
+
+    instruction_difficulty = df_gamed_out.drop(columns=["model"]).drop_duplicates("index")["instruction_difficulty"]
+
+    df_gamed = pd.read_csv('./df_gamed.csv')
+    df_gamed['instruction_difficulty'] = df_gamed_out['instruction_difficulty']
 
     # 2. add features necessary for the glm
     df = df_annotations.reset_index()
@@ -260,8 +266,8 @@ def _get_featurized_data(
         mask_lower = tokens == "m"
         df["position_component"] = np.where(
             mask_lower,
-            np.where(pref_raw >= 1.5, 1, -1),
-            np.where(pref_raw < 1.5, 1, -1),
+            np.where(pref_raw >= 1.5, 1, 0),
+            np.where(pref_raw < 1.5, 1, 0),
         )
     else:
         df["position_component"] = 0.0
@@ -280,6 +286,7 @@ def _get_featurized_data(
 
     if regularize_to_baseline_lambda:
         df_gamed_and_m = pd.concat([df_gamed, df], axis=0)
+
         df_XY_train, df_X_test = make_dmatrix_for_model(df_gamed_and_m, df_test, formula=formula)
 
         # divided by 2 because there are two gamed baselines.
