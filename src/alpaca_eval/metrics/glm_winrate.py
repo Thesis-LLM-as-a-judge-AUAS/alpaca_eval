@@ -40,7 +40,7 @@ GLM_INFO = {
         "kwargs": {"n_splits": 5},
     },
     "length_position_controlled_v2_interaction": {
-        "formula": "np.tanh(std_delta_len) + instruction_difficulty + position_component + position_length_interaction + not_gamed_baseline.astype(float) - 1",
+        "formula": "np.tanh(std_delta_len) + instruction_difficulty + position_component + np.tanh(std_delta_len) * position_component + not_gamed_baseline.astype(float) - 1",
         "regularize_to_baseline_lambda": 0.2,
         "kwargs": {"n_splits": 5},
     },
@@ -272,8 +272,6 @@ def _get_featurized_data(
     else:
         df["position_component"] = 0.0
 
-    df['position_length_interaction'] =  df["position_component"] * df["std_delta_len"]
-
     df["preference"] = df["preference"].astype(float).replace({0.0: 1.5}) - 1  # easier to work with in [0,1]
     df["instruction_difficulty"] = df["index"].transform(lambda g: instruction_difficulty[g])
     df["not_gamed_baseline"] = True
@@ -282,7 +280,6 @@ def _get_featurized_data(
     df_test = df[["instruction_difficulty", "not_gamed_baseline"]].copy()
     df_test["std_delta_len"] = 0
     df_test["position_component"] = 0
-    df_test["position_length_interaction"] = 0
 
     if regularize_to_baseline_lambda:
         df_gamed_and_m = pd.concat([df_gamed, df], axis=0)
