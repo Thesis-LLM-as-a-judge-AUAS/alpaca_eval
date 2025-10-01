@@ -294,6 +294,8 @@ def _get_featurized_data(
         sample_weight = None
         df_XY_train, df_X_test = make_dmatrix_for_model(df, df_test, formula=formula)
 
+    print(df_XY_train)
+
     return df_XY_train, df_X_test, sample_weight
 
 

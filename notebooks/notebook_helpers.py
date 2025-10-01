@@ -80,7 +80,7 @@ def load_annotations(lb):
     annotations = {}
 
     for i in lb.index:
-        annotations_file = f"../results/{i}/weighted_alpaca_eval_gpt4_turbo/annotations.json"
+        annotations_file = f"results/{i}/weighted_alpaca_eval_gpt4_turbo/annotations.json"
 
         if os.path.isfile(annotations_file):
             # load actual annotations to see if it was longer or not

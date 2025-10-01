@@ -11,3 +11,5 @@ matplotlib
 dotenv
 seaborn
 statsmodels
+sentence_transformers
+doubleml

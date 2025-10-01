@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import sys
 from pathlib import Path
@@ -161,7 +163,8 @@ def evaluate(
 
             else:
                 # load previously computed annotations so that we can recompute metrics
-                assert output_path is not None and name in leaderboard
+                assert output_path is not None
+
                 output_path = utils.get_output_path(
                     output_path, arg_model_outputs, name, annotators_config=annotators_config
                 )
@@ -176,7 +179,12 @@ def evaluate(
             else:
                 fn_metric_ = fn_metric
 
-            leaderboard[name].update(fn_metric_(annotations, **(metric_kwargs or {})))
+            result_metrics = fn_metric_(annotations, **(metric_kwargs or {}))
+
+            if name in leaderboard:
+                leaderboard[name].update(result_metrics)
+            else:
+                leaderboard[name] = result_metrics
 
         else:
             logging.info(f"Skipping evaluation of {name} as it is already in the precomputed leaderboard.")
@@ -438,7 +446,7 @@ def make_leaderboard(
     if "generator" not in all_model_outputs.columns:
         raise ValueError(f"all_model_outputs should have a column 'generator' with the name of the model.")
 
-    all_annotations = []
+    all_annotations = pd.DataFrame()
     for model in all_model_outputs["generator"].unique():
         model_outputs = all_model_outputs[all_model_outputs["generator"] == model]
         df_leaderboard, annotations = fn_add_to_leaderboard(
@@ -451,8 +459,9 @@ def make_leaderboard(
             current_leaderboard_mode=leaderboard_mode,
             **kwargs,
         )
+
         if annotations is not None:
-            all_annotations += annotations
+            all_annotations = pd.concat([all_annotations, annotations])
         df_leaderboard.to_csv(leaderboard_path)
 
     leaderboard = utils.load_or_convert_to_dataframe(leaderboard_path)
