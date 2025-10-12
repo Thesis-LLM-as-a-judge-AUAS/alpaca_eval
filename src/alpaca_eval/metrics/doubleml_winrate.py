@@ -1,123 +1,366 @@
 from __future__ import annotations
 
+import logging
+import warnings
 from typing import Union, Sequence, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from doubleml import DoubleMLAPOS, DoubleMLData
+from huggingface_hub import hf_hub_download
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsRegressor
 
-from alpaca_eval import utils
+from alpaca_eval import utils, constants
 from .winrate import get_winrate
 
-from sentence_transformers import SentenceTransformer
-from doubleml import DoubleMLIRM, DoubleMLData
+# Suppress sklearn deprecation warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+warnings.filterwarnings("ignore", message=".*force_all_finite.*", category=FutureWarning)
 
-# --- RF defaults + merge with user params
-rf_reg_defaults = dict(
-    n_estimators=600,
-    max_depth=None,
-    min_samples_leaf=5,
-    n_jobs=-1,
-    random_state=42,
+# Suppress DoubleML warnings
+warnings.filterwarnings("ignore", message=".*Propensity predictions.*are close to zero or one.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*The proportion of observations with treatment level.*is less than 5%.*", category=UserWarning)
+
+logreg_defaults = dict(
+    penalty="l2",
+    C=5.0,  # Reduced C for better regularization
+    solver="lbfgs",
+    max_iter=1000,
+    n_jobs=None,
+    random_state=42
 )
-rf_clf_defaults = dict(
-    n_estimators=600,
-    max_depth=None,
-    min_samples_leaf=5,
-    # class_weight can help if treatment classes are imbalanced;
-    # DoubleML tolerates either setting; enable if needed:
-    # class_weight="balanced",
-    n_jobs=-1,
-    random_state=42,
+knn_reg_defaults = dict(
+    n_neighbors=5,  # Reduced neighbors for better generalization
+    weights="uniform",  # Changed from "distance" to "uniform" for stability
+    algorithm="auto",
+    leaf_size=30,
+    p=2,
 )
 
 
 def get_doubleml_length_position_controlled_winrate(
         annotations: Union[pd.DataFrame, Sequence[dict]],
-        rf_reg_params: dict = rf_reg_defaults,
-        rf_clf_params: dict = rf_clf_defaults,
+        rf_reg_params=None,
+        rf_clf_params=None,
         n_folds: int = 5,
         n_rep: int = 1,
 ):
     """
-    Compute length+position controlled winrate via DoubleML (IRM) with RandomForest models.
-
+    Compute length+position controlled winrate via DoubleML (IRM/APOS) with simple models.
+    
+    This function uses Double Machine Learning to estimate average potential outcomes,
+    controlling for length and position bias in preference annotations.
+    
     Steps:
-      1) Convert input annotations to a DataFrame.
-      2) If the model under test equals the baseline model, use a constant 0.5 prediction.
-      3) Else: featurize -> build DoubleMLData -> fit DoubleMLIRM with RF(g) and RF(m).
-      4) Construct the adjusted/orthogonalized target: y_tilde = y - g_hat(X).
-      5) Aggregate metrics via _add_length_controlled_metrics(...).
-
+    1. Convert input annotations to a DataFrame
+    2. Featurize the data (extract length, position, and instruction difficulty features)
+    3. Initialize ML models (KNeighborsRegressor for outcome, LogisticRegression for propensity)
+    4. Setup and fit DoubleMLAPOS model
+    5. Extract nuisance function predictions
+    6. Compute orthogonalized target: y_tilde = y - g_hat(X)
+    7. Handle special cases where generator_1 == model (set to 0.5)
+    8. Aggregate final metrics
+    
     Parameters
     ----------
-    annotations : pd.DataFrame | Sequence[dict]
-        Raw annotations (can be a list of records). Must contain fields required by
-        _get_featurized_data to produce at least: 'preference' (target) and 'model' (treatment).
-    rf_reg_params : dict | None
-        Extra params for RandomForestRegressor (outcome model g). Merged with sane defaults.
-    rf_clf_params : dict | None
-        Extra params for RandomForestClassifier (propensity model m). Merged with sane defaults.
-    n_folds : int
-        Number of cross-fitting folds.
-    n_rep : int
-        Number of cross-fitting repetitions.
-
+    annotations : Union[pd.DataFrame, Sequence[dict]]
+        Input annotations containing preference data, outputs, and metadata.
+    rf_reg_params : dict, optional
+        Parameters for the regression model (outcome function g).
+        If None, uses default KNeighborsRegressor parameters.
+    rf_clf_params : dict, optional
+        Parameters for the classification model (propensity function m).
+        If None, uses default LogisticRegression parameters.
+    n_folds : int, default 5
+        Number of folds for cross-fitting in DoubleML.
+    n_rep : int, default 1
+        Number of repetitions for sample splitting in DoubleML.
+    
     Returns
     -------
-    Any
-        Whatever _add_length_controlled_metrics returns in your project
-        (e.g., a metrics dict/Series/DataFrame).
+    dict
+        Dictionary containing winrate metrics including:
+        - length_controlled_winrate: The main metric of interest
+        - lc_standard_error: Standard error of the length-controlled winrate
+        - Other standard winrate metrics from get_winrate()
+    
+    Raises
+    ------
+    KeyError
+        If required columns are missing after featurization.
+    AttributeError
+        If predictions cannot be extracted from the DoubleML model.
+    ValueError
+        If predictions are invalid or None.
     """
-    # Normalize input to DataFrame
-    df = utils.convert_to_dataframe(annotations)
+    logging.info("Starting DoubleML length+position controlled winrate computation (LogReg + KNN).")
+    logging.debug(f"Input type: {type(annotations)}, n_folds={n_folds}, n_rep={n_rep}")
 
-    # If this “run” is a baseline-vs-baseline comparison, use the trivial 0.5 predictor
-    if _is_model_baseline(df):
-        predicted_preferences = pd.Series(0.5, index=df.index)
-        return _add_length_controlled_metrics(df, predicted_preferences)
+    # Convert input to DataFrame
+    try:
+        logging.info("Converting annotations to DataFrame.")
+        df = utils.convert_to_dataframe(annotations)
+        logging.debug(f"Converted DataFrame shape: {df.shape}")
+    except Exception:
+        logging.exception("Failed to convert annotations to DataFrame.")
+        raise
 
-    # --- Featurization & sanity checks
-    featured_df = _get_featurized_data(df)
+    # Feature extraction
+    try:
+        logging.info("Featurizing data.")
+        featured_df = _get_featurized_data(df)
+    except Exception:
+        logging.exception("Feature extraction failed.")
+        raise
 
-    print(featured_df)
+    # Initialize ML models
+    try:
+        ml_g, ml_m = _initialize_ml_models(rf_reg_params, rf_clf_params)
+    except Exception:
+        logging.exception("Failed to initialize ML models.")
+        raise
 
-    # required_cols = {"preference", "model"}
-    # missing = required_cols - set(featured_df.columns)
-    # if missing:
-    #     raise KeyError(f"Featurized DataFrame is missing required columns: {sorted(missing)}")
-    #
-    # # Build DoubleMLData (X = all except treatment/target)
-    # dml_data = _get_dml_data(
-    #     featured_df,
-    #     treatment_variable_name="model",
-    #     target_variable_name="preference",
-    # )
-    #
-    # ml_g = RandomForestRegressor(**rf_reg_params)
-    # ml_m = RandomForestClassifier(**rf_clf_params)
-    #
-    # # --- Fit DoubleML IRM with cross-fitting
-    # dml = DoubleMLIRM(
-    #     dml_data,
-    #     ml_g=ml_g,
-    #     ml_m=ml_m,
-    #     n_folds=n_folds,
-    #     n_rep=n_rep,
-    #     trimming_threshold=1e-3,
-    # )
-    # dml.fit(store_predictions=True)
-    #
-    # # Adjusted (orthogonalized) target: y_tilde = y - g_hat(X)
-    # g_hat = np.asarray(dml.predictions["ml_g"]).reshape(-1)  # (n,)
-    # y = featured_df["preference"].to_numpy(dtype=float)
-    # y_tilde = y - g_hat
-    #
-    # # Keep as a Series aligned to the original DataFrame index
-    # predicted_preferences = pd.Series(y_tilde, index=featured_df.index)
+    # Setup and fit DoubleML model
+    try:
+        dml = _setup_and_fit_dml_model(featured_df, ml_g, ml_m, n_folds, n_rep)
+    except Exception:
+        logging.exception("DoubleML model training failed.")
+        raise
 
-    # Aggregate into final metrics (your project-level helper)
-    return get_winrate(annotations)
+    # Extract predictions
+    try:
+        g_hat = _extract_predictions_from_dml(dml, featured_df)
+    except Exception:
+        logging.exception("Failed to extract predictions from DoubleML model.")
+        raise
+
+    # Compute orthogonalized target
+    try:
+        predicted_preferences = _compute_orthogonalized_target(featured_df, g_hat)
+    except Exception:
+        logging.exception("Failed during orthogonalization or preference adjustment.")
+        raise
+
+    # Aggregate final metrics
+    try:
+        logging.info("Aggregating final metrics with _add_length_controlled_metrics.")
+        metrics = _add_length_controlled_metrics(annotations, predicted_preferences)
+        logging.info("Metrics computation completed successfully.")
+        return metrics
+    except Exception:
+        logging.exception("Failed to compute final metrics.")
+        raise
+
+def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None):
+    """
+    Initialize machine learning models for DoubleML estimation.
+    
+    Parameters
+    ----------
+    rf_reg_params : dict, optional
+        Parameters for the regression model (outcome function g). 
+        If None, uses default KNeighborsRegressor parameters.
+    rf_clf_params : dict, optional
+        Parameters for the classification model (propensity function m).
+        If None, uses default LogisticRegression parameters.
+    
+    Returns
+    -------
+    tuple
+        A tuple containing (ml_g, ml_m) where:
+        - ml_g: KNeighborsRegressor instance for outcome function
+        - ml_m: LogisticRegression instance for propensity function
+    """
+    if rf_clf_params is None:
+        rf_clf_params = logreg_defaults
+        logging.debug("Using default LogisticRegression parameters.")
+    
+    if rf_reg_params is None:
+        rf_reg_params = knn_reg_defaults
+        logging.debug("Using default KNeighborsRegressor parameters.")
+    
+    ml_g = KNeighborsRegressor(**rf_reg_params)
+    ml_m = LogisticRegression(**rf_clf_params)
+    
+    logging.info("Initialized ML models: KNeighborsRegressor (g) and LogisticRegression (m)")
+    return ml_g, ml_m
+
+
+def _setup_and_fit_dml_model(featured_df, ml_g, ml_m, n_folds=5, n_rep=1):
+    """
+    Setup and fit a DoubleMLAPOS model with the provided ML models.
+    
+    Parameters
+    ----------
+    featured_df : pd.DataFrame
+        DataFrame with featurized data containing treatment, target, and confounders.
+    ml_g : sklearn.base.BaseEstimator
+        Machine learning model for the outcome function g(X).
+    ml_m : sklearn.base.BaseEstimator
+        Machine learning model for the propensity function m(X).
+    n_folds : int, default 5
+        Number of folds for cross-fitting.
+    n_rep : int, default 1
+        Number of repetitions for sample splitting.
+    
+    Returns
+    -------
+    DoubleMLAPOS
+        Fitted DoubleMLAPOS model.
+    """
+    logging.info("Building DoubleMLData object.")
+    dml_data = _get_dml_data(
+        featured_df,
+        treatment_variable_name="model",
+        target_variable_name="preference",
+    )
+    
+    treatment_levels = np.unique(dml_data.d).tolist()
+    logging.debug(f"Detected treatment levels: {treatment_levels}")
+    
+    logging.info("Initializing DoubleMLAPOS estimator.")
+    dml = DoubleMLAPOS(
+        obj_dml_data=dml_data,
+        ml_g=ml_g,
+        ml_m=ml_m,
+        treatment_levels=treatment_levels,
+        n_folds=n_folds,
+        n_rep=n_rep,
+        score='APO',
+        normalize_ipw=True,
+        trimming_rule='truncate',
+        trimming_threshold=0.01,  # Increased threshold for better stability
+        draw_sample_splitting=True
+    )
+    
+    logging.info("Fitting DoubleML model.")
+    dml.fit(store_predictions=True)
+    logging.info("DoubleML fitting completed successfully.")
+    
+    return dml
+
+
+def _extract_predictions_from_dml(dml, featured_df):
+    """
+    Extract nuisance function predictions from a fitted DoubleML model.
+    
+    This function tries multiple approaches to access predictions from the DoubleML model,
+    handling different versions and storage mechanisms.
+    
+    Parameters
+    ----------
+    dml : DoubleMLAPOS
+        Fitted DoubleMLAPOS model.
+    featured_df : pd.DataFrame
+        DataFrame with featurized data for making predictions if needed.
+    
+    Returns
+    -------
+    np.ndarray
+        Predictions from the outcome function g(X).
+    
+    Raises
+    ------
+    AttributeError
+        If predictions cannot be found in any expected location.
+    ValueError
+        If predictions are None or invalid.
+    """
+    logging.info("Extracting predictions from DoubleML model.")
+    
+    g_hat = None
+    
+    # Try to access predictions from the standard predictions attribute
+    if hasattr(dml, 'predictions'):
+        predictions = dml.predictions
+        logging.debug(f"Found predictions on dml object: {type(predictions)}")
+        g_hat = np.asarray(predictions["ml_g"]).reshape(-1)
+    
+    # Try to access predictions from the framework attribute
+    elif hasattr(dml, 'framework') and hasattr(dml.framework, 'predictions'):
+        predictions = dml.framework.predictions
+        logging.debug(f"Found predictions on framework object: {type(predictions)}")
+        g_hat = np.asarray(predictions["ml_g"]).reshape(-1)
+    
+    # Try to access predictions through modellist (manual prediction)
+    elif hasattr(dml, 'modellist') and len(dml.modellist) > 0:
+        logging.debug("Attempting to access predictions through modellist")
+        logging.debug(f"Modellist length: {len(dml.modellist)}")
+        
+        # Get the confounders (X) from the original data
+        confounders = featured_df.drop(columns=["preference", "model", "generator_1"])
+        logging.debug(f"Confounders shape: {confounders.shape}")
+
+        # Use stored predictions from modellist[0] directly
+        predictions = dml.modellist[0].predictions
+        logging.debug(f"Predictions type: {type(predictions)}")
+        
+        if isinstance(predictions, dict):
+            # For DoubleMLAPOS, we need to combine predictions from all treatment levels
+            # ml_g_d_lvl0 and ml_g_d_lvl1 are predictions for different treatment levels
+            g_hat_combined = []
+            for key in predictions.keys():
+                if key.startswith('ml_g_d_lvl'):
+                    g_hat_combined.append(predictions[key])
+            
+            if g_hat_combined:
+                # Average across treatment levels to get overall outcome predictions
+                g_hat = np.mean(g_hat_combined, axis=0).reshape(-1)
+                logging.debug(f"Successfully got combined predictions from {len(g_hat_combined)} treatment levels: shape {g_hat.shape}")
+            else:
+                raise KeyError("No ml_g_d_lvl* keys found in predictions")
+        else:
+            g_hat = np.asarray(predictions).reshape(-1)
+            logging.debug(f"Successfully got predictions from modellist[0].predictions: shape {g_hat.shape}")
+    
+    else:
+        raise AttributeError("Cannot find predictions attribute in DoubleMLAPOS object, its framework, or modellist")
+    
+    if g_hat is None:
+        raise ValueError("Failed to obtain g_hat predictions")
+    
+    logging.info(f"Successfully extracted predictions with shape: {g_hat.shape}")
+    return g_hat
+
+
+def _compute_orthogonalized_target(featured_df, g_hat):
+    """
+    Compute the orthogonalized target y_tilde = y - g_hat(X).
+    
+    This function also handles special cases where generator_1 == model by setting
+    the predicted preference to 0.5.
+    
+    Parameters
+    ----------
+    featured_df : pd.DataFrame
+        DataFrame with featurized data containing the target variable.
+    g_hat : np.ndarray
+        Predictions from the outcome function g(X).
+    
+    Returns
+    -------
+    pd.Series
+        Orthogonalized target values with same-generator cases set to 0.5.
+    """
+    logging.info("Computing orthogonalized target (y_tilde).")
+    
+    y = featured_df["preference"].to_numpy(dtype=float)
+    y_tilde = y - g_hat
+    
+    predicted_preferences = pd.Series(y_tilde, index=featured_df.index)
+    
+    # Handle special case where generator_1 == model
+    same_generator_mask = featured_df["generator_1"] == featured_df["model"]
+    predicted_preferences[same_generator_mask] = 0.5
+    
+    logging.debug(f"Number of same-generator cases set to 0.5: {same_generator_mask.sum()}")
+    logging.info(f"Computed orthogonalized target with {len(predicted_preferences)} values")
+    
+    return predicted_preferences
+
+
+
 
 
 def _get_dml_data(
@@ -148,13 +391,11 @@ def _get_dml_data(
     if target_variable_name not in featured_df.columns:
         raise KeyError(f"Target column '{target_variable_name}' not found in DataFrame.")
 
-    treatment = featured_df[target_variable_name]
+    treatment = _encode_treatment(featured_df[treatment_variable_name])
     target = featured_df[target_variable_name]
 
-    print(featured_df[treatment_variable_name].unique())
-
-    # take all columns except treatment and target as confounders (X)
-    confounders = featured_df.drop(columns=[treatment_variable_name, target_variable_name])
+    # take all columns except treatment, target, and generator_1 as confounders (X)
+    confounders = featured_df.drop(columns=[treatment_variable_name, target_variable_name, "generator_1"])
 
     # wrap into DoubleMLData
     dml_data = DoubleMLData.from_arrays(
@@ -164,6 +405,28 @@ def _get_dml_data(
     )
 
     return dml_data
+
+
+def _encode_treatment(treatment_series: pd.Series):
+    """
+    Encodes the treatment column into numeric values if it contains strings.
+
+    Parameters
+    ----------
+    treatment_series : pd.Series
+        A pandas Series representing the treatment variable.
+        It may contain string or numeric values.
+
+    Returns
+    -------
+    pd.Series or np.ndarray
+        If the column is of type 'object' (string), categorical codes are returned.
+        If the column is already numeric, it is returned unchanged.
+    """
+    if treatment_series.dtype == 'object':
+        return pd.Categorical(treatment_series).codes
+
+    return treatment_series
 
 
 def _add_length_controlled_metrics(annotations: pd.Union[pd.DataFrame, Sequence[dict]],
@@ -186,41 +449,14 @@ def _add_length_controlled_metrics(annotations: pd.Union[pd.DataFrame, Sequence[
         - "length_controlled_winrate"
         - "lc_standard_error"
     """
+    print(predicted_preferences)
+
     metrics = dict(get_winrate(annotations))  # get the non-length controlled winrate + copy to avoid mutating input
 
     metrics["length_controlled_winrate"] = predicted_preferences.mean() * 100
     metrics["lc_standard_error"] = predicted_preferences.sem() * 100
 
     return metrics
-
-
-def _is_model_baseline(df: pd.DataFrame) -> bool:
-    """
-    Check whether the model in column 'generator_2' is the same as
-    the baseline model in column 'generator_1'.
-
-    Assumes df["generator_2"] has only one unique value.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input dataframe with columns "generator_1" and "generator_2".
-
-    Returns
-    -------
-    bool
-        True if the model in generator_2 is the same as the baseline model
-        in generator_1, False otherwise.
-    """
-
-    uniques_gen2 = df["generator_2"].unique()
-
-    assert len(uniques_gen2) == 1, "generator_2 must contain exactly one unique model"
-
-    model_name = uniques_gen2[0]
-    baseline_name = df["generator_1"].unique()[0]
-
-    return model_name == baseline_name
 
 
 def _get_featurized_data(df_annotations: pd.DataFrame):
@@ -241,7 +477,7 @@ def _get_featurized_data(df_annotations: pd.DataFrame):
     std_delta_len = len_1 - len_2
 
     # Reinitialization
-    df = df[["preference", "instruction", "generator_2"]].copy().rename(columns={"generator_2": "model"})
+    df = df[["preference", "generator_1", "generator_2", "index"]].copy().rename(columns={"generator_2": "model"})
 
     # New features
     df["std_delta_len"] = np.tanh(std_delta_len / std_delta_len.std())
@@ -251,60 +487,26 @@ def _get_featurized_data(df_annotations: pd.DataFrame):
     df["preference"] = df["preference"].astype(float).replace({0.0: 1.5}) - 1  # easier to work with in [0,1]
 
     # Embed 'instruction' feature
-    df = _embed_feature_to_df(df, instr_col="instruction")
+    df["instruction_difficulty"] = _get_instruction_difficulty(df)
 
-    return df
+    return df.dropna()
 
 
-def _embed_feature_to_df(
-        df_annotations: pd.DataFrame,
-        instr_col: str,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        prefix: str | None = None,
-        drop_original: bool = True,
-) -> pd.DataFrame:
-    """
-    Encode df[instr_col] into embeddings and append them as new columns to df.
-    Returns a new DataFrame with preserved index.
+def _get_instruction_difficulty(df_annotations):
+    out = hf_hub_download(
+        repo_id="tatsu-lab/alpaca_eval",
+        filename="df_gamed.csv",
+        repo_type="dataset",
+        token=constants.DATASETS_TOKEN,
+        force_download=constants.DATASETS_FORCE_DOWNLOAD,
+        cache_dir=constants.DEFAULT_CACHE_DIR,
+    )
 
-    Parameters
-    ----------
-    df_annotations : DataFrame
-        Input DataFrame.
-    instr_col : str
-        Name of the text column to encode.
-    model_name : str
-        SentenceTransformer model name (default MiniLM 384-d).
-    prefix : str | None
-        Prefix for new embedding column names. If None, use instr_col.
-    drop_original : bool
-        If True, remove the original text column after adding embeddings.
+    df_gamed_out = pd.read_csv(out)
 
-    Returns
-    -------
-    DataFrame
-        Copy of df with additional embedding columns.
-    """
-    if instr_col not in df_annotations.columns:
-        raise KeyError(f"Column '{instr_col}' not found in df.")
+    instruction_difficulty = df_gamed_out.drop(columns=["model"]).drop_duplicates("index")["instruction_difficulty"]
 
-    model = SentenceTransformer(model_name)
-    texts = df_annotations[instr_col].astype(str).tolist()
-
-    emb = model.encode(texts, batch_size=512, show_progress_bar=False, normalize_embeddings=False)
-    emb = np.asarray(emb)
-
-    base = prefix or instr_col
-
-    emb_cols = [f"{base}_emb_{i}" for i in range(emb.shape[1])]
-    emb_df = pd.DataFrame(emb, index=df_annotations.index, columns=emb_cols)
-
-    out = pd.concat([df_annotations.copy(), emb_df], axis=1)
-
-    if drop_original:
-        out = out.drop(columns=[instr_col])
-
-    return out
+    return df_annotations["index"].transform(lambda g: instruction_difficulty[g % len(instruction_difficulty)])
 
 
 def _extract_position_component(
