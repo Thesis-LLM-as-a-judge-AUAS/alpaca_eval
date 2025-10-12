@@ -601,8 +601,125 @@ def analyze_evaluators(
         )
 
 
+def evaluate_multiple(
+    model_outputs: AnyLoadableDF,
+    reference_outputs: AnyLoadableDF = constants.ALPACAEVAL_REFERENCE_OUTPUTS,
+    annotators_config: AnyPath = constants.DEFAULT_ANNOTATOR_CONFIG,
+    name: str = "all",
+    output_path: Optional[Union[AnyPath, str]] = "auto",
+    fn_metric: str = "get_doubleml_length_position_controlled_winrate",
+    sort_by: str = "length_controlled_winrate",
+    is_return_instead_of_print: bool = True,
+    is_recompute_metrics_only: bool = False,
+    **kwargs,
+):
+    """Evaluate multiple models from a single large dataset using DoubleML.
+    
+    This function takes a large dataset containing outputs from multiple models
+    and evaluates them using the DoubleML length+position controlled winrate metric.
+    
+    Parameters
+    ----------
+    model_outputs : path or data
+        The outputs of multiple models to evaluate. Should contain outputs from
+        different models in a single dataset.
+    reference_outputs : path or data, optional
+        The reference outputs to compare against.
+    annotators_config : path, optional
+        Path to annotator configuration.
+    name : str, default "all"
+        Name for this evaluation run.
+    output_path : path or str, optional
+        Path to save results.
+    fn_metric : str, default "get_doubleml_length_position_controlled_winrate"
+        Metric function to use for evaluation.
+    sort_by : str, default "length_controlled_winrate"
+        Column to sort results by.
+    is_return_instead_of_print : bool, default True
+        Whether to return results instead of printing.
+    is_recompute_metrics_only : bool, default False
+        Whether to only recompute metrics using existing annotations.
+        If True, loads annotations from output_path/annotations.json instead of creating new ones.
+    **kwargs
+        Additional arguments passed to the metric function.
+    
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with evaluation results for each model.
+    """
+    logging.info(f"Evaluating multiple models from dataset: {name}")
+    
+    # Load the large dataset
+    model_outputs = utils.load_or_convert_to_dataframe(model_outputs)
+    reference_outputs = utils.load_or_convert_to_dataframe(reference_outputs)
+    
+    logging.info(f"Loaded {len(model_outputs)} model outputs and {len(reference_outputs)} reference outputs")
+    
+    # Get unique models
+    models = model_outputs['generator'].unique() if 'generator' in model_outputs.columns else ['model']
+    logging.info(f"Found {len(models)} models: {models}")
+    
+    if is_recompute_metrics_only:
+        # Load existing annotations
+        assert output_path is not None, "output_path must be specified when is_recompute_metrics_only=True"
+        output_path = utils.get_output_path(output_path, model_outputs, name, annotators_config=annotators_config)
+        annotations_path = output_path / "annotations.json"
+        
+        if not annotations_path.exists():
+            raise FileNotFoundError(f"Annotations file not found: {annotations_path}")
+        
+        logging.info(f"Loading existing annotations from {annotations_path}")
+        annotations = pd.read_json(annotations_path).to_dict('records')
+        logging.info(f"Loaded {len(annotations)} existing annotations")
+    else:
+        # Create annotations for all models
+        annotator = annotators.PairwiseAnnotator(annotators_config=annotators_config)
+        annotations = annotator.annotate_head2head(
+            outputs_1=reference_outputs, 
+            outputs_2=model_outputs
+        )
+        
+        logging.info(f"Created {len(annotations)} annotations")
+    
+    # Apply the metric function
+    if isinstance(fn_metric, str):
+        fn_metric_ = getattr(metrics, fn_metric)
+    else:
+        fn_metric_ = fn_metric
+    
+    result_metrics = fn_metric_(annotations, **kwargs)
+    
+    # Convert to DataFrame
+    df_results = pd.DataFrame(result_metrics)
+    
+    # Sort by specified column
+    if sort_by in df_results.columns:
+        df_results = df_results.sort_values(by=sort_by, ascending=False)
+    
+    # Save results if output_path is specified
+    if output_path is not None:
+        output_path = utils.get_output_path(output_path, model_outputs, name, annotators_config=annotators_config)
+        output_path.mkdir(exist_ok=True, parents=True)
+        
+        # Save leaderboard
+        df_results.to_csv(output_path / "leaderboard.csv", index=False)
+        
+        # Save annotations only if we created new ones
+        if not is_recompute_metrics_only:
+            pd.DataFrame(annotations).to_json(output_path / "annotations.json", orient="records")
+        
+        logging.info(f"Results saved to {output_path}")
+    
+    if is_return_instead_of_print:
+        return df_results
+    else:
+        print(df_results.to_string(index=False))
+
+
 ALL_FUNCTIONS = {
     "evaluate": evaluate,
+    "evaluate_multiple": evaluate_multiple,
     "evaluate_from_model": evaluate_from_model,
     "make_leaderboard": make_leaderboard,
     "analyze_evaluators": analyze_evaluators,

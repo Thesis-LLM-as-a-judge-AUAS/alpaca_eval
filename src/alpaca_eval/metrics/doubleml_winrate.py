@@ -79,11 +79,13 @@ def get_doubleml_length_position_controlled_winrate(
     
     Returns
     -------
-    dict
-        Dictionary containing winrate metrics including:
+    list[dict]
+        List of dictionaries containing winrate metrics for each model including:
         - length_controlled_winrate: The main metric of interest
         - lc_standard_error: Standard error of the length-controlled winrate
-        - Other standard winrate metrics from get_winrate()
+        - win_rate: Standard winrate
+        - standard_error: Standard error of winrate
+        - model: Model name
     
     Raises
     ------
@@ -145,9 +147,9 @@ def get_doubleml_length_position_controlled_winrate(
     # Aggregate final metrics
     try:
         logging.info("Aggregating final metrics with _add_length_controlled_metrics.")
-        metrics = _add_length_controlled_metrics(annotations, predicted_preferences)
-        logging.info("Metrics computation completed successfully.")
-        return metrics
+        metrics_list = _add_length_controlled_metrics(annotations, predicted_preferences)
+        logging.info(f"Metrics computation completed successfully. Found {len(metrics_list)} models.")
+        return metrics_list
     except Exception:
         logging.exception("Failed to compute final metrics.")
         raise
@@ -430,10 +432,12 @@ def _encode_treatment(treatment_series: pd.Series):
 
 
 def _add_length_controlled_metrics(annotations: pd.Union[pd.DataFrame, Sequence[dict]],
-                                   predicted_preferences: pd.Series) -> dict:
+                                   predicted_preferences: pd.Series) -> list[dict]:
     """
     Add length-controlled winrate and standard error to the metrics dictionary,
     using df_annotations to construct the predicted preferences.
+    
+    This function now returns a list of metrics for each model separately.
 
     Parameters
     ----------
@@ -444,19 +448,39 @@ def _add_length_controlled_metrics(annotations: pd.Union[pd.DataFrame, Sequence[
 
     Returns
     -------
-    dict
-        Updated dictionary with new keys:
+    list[dict]
+        List of dictionaries with metrics for each model:
         - "length_controlled_winrate"
         - "lc_standard_error"
+        - "win_rate" 
+        - "standard_error"
     """
-    print(predicted_preferences)
-
-    metrics = dict(get_winrate(annotations))  # get the non-length controlled winrate + copy to avoid mutating input
-
-    metrics["length_controlled_winrate"] = predicted_preferences.mean() * 100
-    metrics["lc_standard_error"] = predicted_preferences.sem() * 100
-
-    return metrics
+    df = utils.convert_to_dataframe(annotations)
+    
+    # Get unique models
+    models = df['generator_2'].unique()
+    
+    metrics_list = []
+    
+    for model in models:
+        # Filter annotations for this model
+        model_mask = df['generator_2'] == model
+        model_annotations = df[model_mask]
+        model_preferences = predicted_preferences[model_mask]
+        
+        # Get basic winrate metrics for this model
+        model_metrics = dict(get_winrate(model_annotations))
+        
+        # Add length-controlled metrics
+        model_metrics["length_controlled_winrate"] = model_preferences.mean() * 100
+        model_metrics["lc_standard_error"] = model_preferences.sem() * 100
+        
+        # Add model name
+        model_metrics["model"] = model
+        
+        metrics_list.append(model_metrics)
+    
+    return metrics_list
 
 
 def _get_featurized_data(df_annotations: pd.DataFrame):
