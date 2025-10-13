@@ -10,6 +10,7 @@ from doubleml import DoubleMLAPOS, DoubleMLData
 from huggingface_hub import hf_hub_download
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import GradientBoostingRegressor
 
 from alpaca_eval import utils, constants
 from .winrate import get_winrate
@@ -22,20 +23,24 @@ warnings.filterwarnings("ignore", message=".*force_all_finite.*", category=Futur
 warnings.filterwarnings("ignore", message=".*Propensity predictions.*are close to zero or one.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*The proportion of observations with treatment level.*is less than 5%.*", category=UserWarning)
 
+gb_reg_defaults = dict(
+    loss='squared_error',  # Стандартная функция потерь для регрессии
+    n_estimators=50,  # Меньше деревьев для стабильности
+    learning_rate=0.1,
+    max_depth=4,  # Неглубокая для избежания переобучения
+    min_samples_split=10,  # Больше примеров для разделения
+    min_samples_leaf=5,   # Больше примеров в листе
+    subsample=0.8,        # Bootstrap для стабильности
+    random_state=42
+)
+
 logreg_defaults = dict(
     penalty="l2",
-    C=5.0,  # Reduced C for better regularization
+    C=1.0,  # Умеренная регуляризация
     solver="lbfgs",
     max_iter=1000,
     n_jobs=None,
     random_state=42
-)
-knn_reg_defaults = dict(
-    n_neighbors=5,  # Reduced neighbors for better generalization
-    weights="uniform",  # Changed from "distance" to "uniform" for stability
-    algorithm="auto",
-    leaf_size=30,
-    p=2,
 )
 
 
@@ -47,7 +52,7 @@ def get_doubleml_length_position_controlled_winrate(
         n_rep: int = 1,
 ):
     """
-    Compute length+position controlled winrate via DoubleML (IRM/APOS) with simple models.
+    Compute length+position controlled winrate via DoubleML (IRM/APOS) with strong models.
     
     This function uses Double Machine Learning to estimate average potential outcomes,
     controlling for length and position bias in preference annotations.
@@ -55,7 +60,7 @@ def get_doubleml_length_position_controlled_winrate(
     Steps:
     1. Convert input annotations to a DataFrame
     2. Featurize the data (extract length, position, and instruction difficulty features)
-    3. Initialize ML models (KNeighborsRegressor for outcome, LogisticRegression for propensity)
+    3. Initialize ML models (GradientBoostingRegressor for outcome, LogisticRegression for propensity)
     4. Setup and fit DoubleMLAPOS model
     5. Extract nuisance function predictions
     6. Compute orthogonalized target: y_tilde = y - g_hat(X)
@@ -68,7 +73,7 @@ def get_doubleml_length_position_controlled_winrate(
         Input annotations containing preference data, outputs, and metadata.
     rf_reg_params : dict, optional
         Parameters for the regression model (outcome function g).
-        If None, uses default KNeighborsRegressor parameters.
+        If None, uses default GradientBoostingRegressor parameters.
     rf_clf_params : dict, optional
         Parameters for the classification model (propensity function m).
         If None, uses default LogisticRegression parameters.
@@ -96,7 +101,7 @@ def get_doubleml_length_position_controlled_winrate(
     ValueError
         If predictions are invalid or None.
     """
-    logging.info("Starting DoubleML length+position controlled winrate computation (LogReg + KNN).")
+    logging.info("Starting DoubleML length+position controlled winrate computation (GradientBoosting + LogisticRegression).")
     logging.debug(f"Input type: {type(annotations)}, n_folds={n_folds}, n_rep={n_rep}")
 
     # Convert input to DataFrame
@@ -162,7 +167,7 @@ def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None):
     ----------
     rf_reg_params : dict, optional
         Parameters for the regression model (outcome function g). 
-        If None, uses default KNeighborsRegressor parameters.
+        If None, uses default GradientBoostingRegressor parameters.
     rf_clf_params : dict, optional
         Parameters for the classification model (propensity function m).
         If None, uses default LogisticRegression parameters.
@@ -171,7 +176,7 @@ def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None):
     -------
     tuple
         A tuple containing (ml_g, ml_m) where:
-        - ml_g: KNeighborsRegressor instance for outcome function
+        - ml_g: GradientBoostingRegressor instance for outcome function
         - ml_m: LogisticRegression instance for propensity function
     """
     if rf_clf_params is None:
@@ -179,13 +184,13 @@ def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None):
         logging.debug("Using default LogisticRegression parameters.")
     
     if rf_reg_params is None:
-        rf_reg_params = knn_reg_defaults
-        logging.debug("Using default KNeighborsRegressor parameters.")
+        rf_reg_params = gb_reg_defaults
+        logging.debug("Using default GradientBoostingRegressor parameters.")
     
-    ml_g = KNeighborsRegressor(**rf_reg_params)
+    ml_g = GradientBoostingRegressor(**rf_reg_params)
     ml_m = LogisticRegression(**rf_clf_params)
     
-    logging.info("Initialized ML models: KNeighborsRegressor (g) and LogisticRegression (m)")
+    logging.info("Initialized ML models: GradientBoostingRegressor (g) and LogisticRegression (m)")
     return ml_g, ml_m
 
 
