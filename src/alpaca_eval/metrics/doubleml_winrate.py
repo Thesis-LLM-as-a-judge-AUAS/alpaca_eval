@@ -8,9 +8,10 @@ import numpy as np
 import pandas as pd
 from doubleml import DoubleMLAPOS, DoubleMLData
 from huggingface_hub import hf_hub_download
-from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsRegressor
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import make_scorer, log_loss, mean_squared_error
 
 from alpaca_eval import utils, constants
 from .winrate import get_winrate
@@ -23,20 +24,23 @@ warnings.filterwarnings("ignore", message=".*force_all_finite.*", category=Futur
 warnings.filterwarnings("ignore", message=".*Propensity predictions.*are close to zero or one.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*The proportion of observations with treatment level.*is less than 5%.*", category=UserWarning)
 
-gb_reg_defaults = dict(
-    loss='squared_error',  # Стандартная функция потерь для регрессии
-    n_estimators=50,  # Меньше деревьев для стабильности
-    learning_rate=0.1,
-    max_depth=4,  # Неглубокая для избежания переобучения
-    min_samples_split=10,  # Больше примеров для разделения
-    min_samples_leaf=5,   # Больше примеров в листе
-    subsample=0.8,        # Bootstrap для стабильности
+# Default parameter grids for cross-validation
+gb_reg_param_grid = {
+    'n_estimators': [50, 100, 150, 200],
+    'learning_rate': [0.01, 0.05, 0.1, 0.15, 0.2],
+    'max_depth': [2, 3, 4, 5, 6],
+    'min_samples_split': [5, 10, 20, 30],
+    'min_samples_leaf': [2, 5, 10, 15],
+    'subsample': [0.7, 0.8, 0.9, 1.0]
+}
+
+gb_reg_base_params = dict(
+    loss='squared_error',
     random_state=42
 )
 
-logreg_defaults = dict(
+logreg_cv_params = dict(
     penalty="l2",
-    C=1.0,  # Умеренная регуляризация
     solver="lbfgs",
     max_iter=1000,
     n_jobs=None,
@@ -50,6 +54,7 @@ def get_doubleml_length_position_controlled_winrate(
         rf_clf_params=None,
         n_folds: int = 5,
         n_rep: int = 1,
+        cv_folds: int = 5,
 ):
     """
     Compute length+position controlled winrate via DoubleML (IRM/APOS) with strong models.
@@ -57,10 +62,14 @@ def get_doubleml_length_position_controlled_winrate(
     This function uses Double Machine Learning to estimate average potential outcomes,
     controlling for length and position bias in preference annotations.
     
+    The function uses cross-validation for hyperparameter tuning:
+    - GradientBoostingRegressor: GridSearchCV with MSE (mean squared error) metric
+    - LogisticRegression: LogisticRegressionCV with log_loss metric
+    
     Steps:
     1. Convert input annotations to a DataFrame
     2. Featurize the data (extract length, position, and instruction difficulty features)
-    3. Initialize ML models (GradientBoostingRegressor for outcome, LogisticRegression for propensity)
+    3. Initialize ML models with cross-validation (GridSearchCV for regression, LogisticRegressionCV for classification)
     4. Setup and fit DoubleMLAPOS model
     5. Extract nuisance function predictions
     6. Compute orthogonalized target: y_tilde = y - g_hat(X)
@@ -73,14 +82,17 @@ def get_doubleml_length_position_controlled_winrate(
         Input annotations containing preference data, outputs, and metadata.
     rf_reg_params : dict, optional
         Parameters for the regression model (outcome function g).
-        If None, uses default GradientBoostingRegressor parameters.
+        If None, uses GridSearchCV with default parameter grid.
+        If dict provided, used as base parameters or to customize the search grid.
     rf_clf_params : dict, optional
         Parameters for the classification model (propensity function m).
-        If None, uses default LogisticRegression parameters.
+        If None, uses default LogisticRegressionCV parameters with log_loss metric.
     n_folds : int, default 5
         Number of folds for cross-fitting in DoubleML.
     n_rep : int, default 1
         Number of repetitions for sample splitting in DoubleML.
+    cv_folds : int, default 5
+        Number of folds for cross-validation hyperparameter tuning.
     
     Returns
     -------
@@ -123,7 +135,7 @@ def get_doubleml_length_position_controlled_winrate(
 
     # Initialize ML models
     try:
-        ml_g, ml_m = _initialize_ml_models(rf_reg_params, rf_clf_params)
+        ml_g, ml_m = _initialize_ml_models(rf_reg_params, rf_clf_params, cv_folds)
     except Exception:
         logging.exception("Failed to initialize ML models.")
         raise
@@ -159,38 +171,81 @@ def get_doubleml_length_position_controlled_winrate(
         logging.exception("Failed to compute final metrics.")
         raise
 
-def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None):
+def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None, cv_folds=5):
     """
-    Initialize machine learning models for DoubleML estimation.
+    Initialize machine learning models for DoubleML estimation with cross-validation.
     
     Parameters
     ----------
     rf_reg_params : dict, optional
         Parameters for the regression model (outcome function g). 
-        If None, uses default GradientBoostingRegressor parameters.
+        If None, uses GridSearchCV with default parameter grid.
+        If dict provided, used as base parameters or to customize the search grid.
     rf_clf_params : dict, optional
         Parameters for the classification model (propensity function m).
-        If None, uses default LogisticRegression parameters.
+        If None, uses default LogisticRegressionCV parameters.
+    cv_folds : int, default 5
+        Number of folds for cross-validation.
     
     Returns
     -------
     tuple
         A tuple containing (ml_g, ml_m) where:
-        - ml_g: GradientBoostingRegressor instance for outcome function
-        - ml_m: LogisticRegression instance for propensity function
+        - ml_g: GridSearchCV instance for outcome function
+        - ml_m: LogisticRegressionCV instance for propensity function
     """
+    # Initialize LogisticRegressionCV with log_loss metric
     if rf_clf_params is None:
-        rf_clf_params = logreg_defaults
-        logging.debug("Using default LogisticRegression parameters.")
+        rf_clf_params = logreg_cv_params.copy()
     
-    if rf_reg_params is None:
-        rf_reg_params = gb_reg_defaults
-        logging.debug("Using default GradientBoostingRegressor parameters.")
+    # Create scorer for log_loss
+    log_loss_scorer = make_scorer(
+        log_loss, 
+        greater_is_better=False, 
+        needs_proba=True
+    )
     
-    ml_g = GradientBoostingRegressor(**rf_reg_params)
-    ml_m = LogisticRegression(**rf_clf_params)
+    # Add CV parameters
+    rf_clf_params_cv = rf_clf_params.copy()
+    rf_clf_params_cv['cv'] = cv_folds
+    rf_clf_params_cv['scoring'] = log_loss_scorer
     
-    logging.info("Initialized ML models: GradientBoostingRegressor (g) and LogisticRegression (m)")
+    ml_m = LogisticRegressionCV(**rf_clf_params_cv)
+    logging.debug(f"Using LogisticRegressionCV with {cv_folds} folds and log_loss metric.")
+    
+    # Initialize GradientBoostingRegressor with GridSearchCV and MSE metric
+    # Always use default parameter grid
+    param_grid = gb_reg_param_grid.copy()
+    base_params = gb_reg_base_params.copy()
+    
+    # If rf_reg_params provided, add parameters not in param_grid to base_params
+    if rf_reg_params is not None:
+        for key, value in rf_reg_params.items():
+            if key not in gb_reg_param_grid.keys():
+                base_params[key] = value
+    
+    # Create base model
+    base_model = GradientBoostingRegressor(**base_params)
+    
+    # Create MSE scorer
+    mse_scorer = make_scorer(
+        mean_squared_error,
+        greater_is_better=False
+    )
+    
+    # Create GridSearchCV
+    ml_g = GridSearchCV(
+        base_model,
+        param_grid,
+        cv=cv_folds,
+        scoring=mse_scorer,
+        n_jobs=-1,
+        verbose=0
+    )
+    logging.debug(f"Using GridSearchCV with {cv_folds} folds and MSE metric for GradientBoostingRegressor.")
+    logging.debug(f"Parameter grid size: {len(param_grid)} parameters.")
+    
+    logging.info("Initialized ML models: GridSearchCV (g) with MSE and LogisticRegressionCV (m) with log_loss")
     return ml_g, ml_m
 
 
@@ -202,10 +257,12 @@ def _setup_and_fit_dml_model(featured_df, ml_g, ml_m, n_folds=5, n_rep=1):
     ----------
     featured_df : pd.DataFrame
         DataFrame with featurized data containing treatment, target, and confounders.
-    ml_g : sklearn.base.BaseEstimator
+    ml_g : sklearn.base.BaseEstimator or GridSearchCV
         Machine learning model for the outcome function g(X).
-    ml_m : sklearn.base.BaseEstimator
+        Can be GradientBoostingRegressor or GridSearchCV wrapper.
+    ml_m : LogisticRegressionCV
         Machine learning model for the propensity function m(X).
+        Uses LogisticRegressionCV with cross-validation.
     n_folds : int, default 5
         Number of folds for cross-fitting.
     n_rep : int, default 1
