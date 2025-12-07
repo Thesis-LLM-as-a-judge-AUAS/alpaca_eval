@@ -10,8 +10,8 @@ from doubleml import DoubleMLAPOS, DoubleMLData
 from huggingface_hub import hf_hub_download
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegressionCV
-from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import make_scorer, log_loss, mean_squared_error
+from sklearn.model_selection import GridSearchCV
 
 from alpaca_eval import utils, constants
 from .winrate import get_winrate
@@ -26,12 +26,12 @@ warnings.filterwarnings("ignore", message=".*The proportion of observations with
 
 # Default parameter grids for cross-validation
 gb_reg_param_grid = {
-    'n_estimators': [50, 100, 150, 200],
-    'learning_rate': [0.01, 0.05, 0.1, 0.15, 0.2],
-    'max_depth': [2, 3, 4, 5, 6],
-    'min_samples_split': [5, 10, 20, 30],
-    'min_samples_leaf': [2, 5, 10, 15],
-    'subsample': [0.7, 0.8, 0.9, 1.0]
+    'n_estimators': [100, 150, 200],  # Reduced from 4 to 3
+    'learning_rate': [0.05, 0.1, 0.15],  # Reduced from 5 to 3
+    'max_depth': [3, 4, 5],  # Reduced from 5 to 3
+    'min_samples_split': [10, 20],  # Reduced from 4 to 2
+    'min_samples_leaf': [5, 10],  # Reduced from 4 to 2
+    'subsample': [0.8, 0.9, 1.0]  # Reduced from 4 to 3
 }
 
 gb_reg_base_params = dict(
@@ -202,7 +202,7 @@ def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None, cv_folds=5):
     log_loss_scorer = make_scorer(
         log_loss, 
         greater_is_better=False, 
-        needs_proba=True
+        response_method='predict_proba'
     )
     
     # Add CV parameters
@@ -233,17 +233,28 @@ def _initialize_ml_models(rf_reg_params=None, rf_clf_params=None, cv_folds=5):
         greater_is_better=False
     )
     
-    # Create GridSearchCV
+    # Create GridSearchCV with verbose output
+    # verbose=1: prints progress for each parameter combination
+    # verbose=2: prints detailed info including score for each combination
     ml_g = GridSearchCV(
         base_model,
         param_grid,
         cv=cv_folds,
         scoring=mse_scorer,
         n_jobs=-1,
-        verbose=0
+        verbose=2  # Enable detailed verbose output to see training progress and scores
     )
-    logging.debug(f"Using GridSearchCV with {cv_folds} folds and MSE metric for GradientBoostingRegressor.")
-    logging.debug(f"Parameter grid size: {len(param_grid)} parameters.")
+    # Calculate total number of parameter combinations
+    total_combinations = 1
+    for param_values in param_grid.values():
+        total_combinations *= len(param_values)
+    total_fits = total_combinations * cv_folds
+    
+    logging.info(f"GridSearchCV configuration:")
+    logging.info(f"  - Parameter combinations: {total_combinations}")
+    logging.info(f"  - CV folds: {cv_folds}")
+    logging.info(f"  - Total fits per GridSearchCV: {total_fits}")
+    logging.info(f"  - Verbose=2 mode enabled - you will see detailed training progress with scores for each parameter combination.")
     
     logging.info("Initialized ML models: GridSearchCV (g) with MSE and LogisticRegressionCV (m) with log_loss")
     return ml_g, ml_m
@@ -299,7 +310,38 @@ def _setup_and_fit_dml_model(featured_df, ml_g, ml_m, n_folds=5, n_rep=1):
     )
     
     logging.info("Fitting DoubleML model.")
-    dml.fit(store_predictions=True)
+    logging.info("=" * 80)
+    logging.info("Training will show sklearn verbose output:")
+    logging.info("  - GridSearchCV: progress for each parameter combination")
+    logging.info("  - This will be repeated for each fold in cross-fitting (n_folds={}, n_rep={})".format(n_folds, n_rep))
+    logging.info("=" * 80)
+    
+    # Redirect sklearn verbose output to logging
+    # sklearn's verbose prints to stdout, so we capture it and redirect to logging
+    from contextlib import redirect_stdout
+    
+    # Create a simple stream that redirects to logging
+    class SklearnLogStream:
+        def __init__(self):
+            self.buffer = []
+        
+        def write(self, s):
+            if s and s.strip():  # Only log non-empty content
+                # Remove trailing newlines and log
+                for line in s.rstrip().split('\n'):
+                    if line.strip():
+                        logging.info(f"[sklearn] {line}")
+            return len(s)
+        
+        def flush(self):
+            pass
+    
+    # Fit with verbose output captured and logged
+    sklearn_log_stream = SklearnLogStream()
+    with redirect_stdout(sklearn_log_stream):
+        dml.fit(store_predictions=True)
+    
+    logging.info("=" * 80)
     logging.info("DoubleML fitting completed successfully.")
     
     return dml
